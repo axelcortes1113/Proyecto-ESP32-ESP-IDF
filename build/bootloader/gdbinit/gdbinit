@@ -1,0 +1,2 @@
+source C:/ESP/Proyecto/build/bootloader/gdbinit/symbols
+source C:/ESP/Proyecto/build/bootloader/gdbinit/connect

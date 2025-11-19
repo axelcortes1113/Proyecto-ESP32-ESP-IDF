@@ -1,0 +1,2 @@
+source C:/ESP/Proyecto/build/gdbinit/symbols
+source C:/ESP/Proyecto/build/gdbinit/connect

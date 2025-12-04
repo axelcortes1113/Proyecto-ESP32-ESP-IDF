@@ -1,7 +1,7 @@
 {
     "version":            "1.2",
     "project_name":       "Proyecto",
-    "project_version":    "1",
+    "project_version":    "7a4f459-dirty",
     "project_path":       "C:/ESP/Proyecto",
     "idf_path":           "C:/ESP32/v5.5.1/esp-idf",
     "build_dir":          "C:/ESP/Proyecto/build",

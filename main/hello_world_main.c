@@ -21,7 +21,8 @@
 #define WIFI_SSID "Bryan"
 #define WIFI_PASS "12345678"
 
-#define SERVER_URL "https://esp32-telemetry.onrender.com/api/telemetry"  // Tu URL pública de REDNER
+#define SERVER_URL "https://telemetry-gamma.vercel.app/api/telemetry"
+#define UPDATE_URL "https://telemetry-gamma.vercel.app/api/update-interval"
 
 #define MQTT_URI  "mqtts://g5f7ea80.ala.us-east-1.emqxsl.com:8883"
 #define MQTT_USER "Bryan"
@@ -81,11 +82,11 @@ bool dht22_read(int *temperature, int *humidity) {
     return true;
 }
 
-// ------------ SNTP / TIEMPO REAL / HORA CORRECTA DESDE INTERNET------------
+// ------------ SNTP / TIEMPO REAL ------------
 void init_sntp() {
     ESP_LOGI(TAG, "Inicializando SNTP...");
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(0, "mx.pool.ntp.org");
     esp_sntp_init();
 }
 
@@ -98,7 +99,7 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
         ESP_LOGI(TAG, "Reconectando WiFi...");
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "WiFi Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "WiFi conectado! IP: " IPSTR, IP2STR(&event->ip_info.ip));
     }
 }
 
@@ -127,12 +128,9 @@ static void wifi_init(void) {
 // ------------ MQTT ------------
 static void mqtt_event_handler(void *handler, esp_event_base_t base, int32_t event_id, void *event_data) {
     if (event_id == MQTT_EVENT_CONNECTED) {
-        ESP_LOGI(TAG, "MQTT conectado");
-        esp_mqtt_client_subscribe(client, MQTT_TOPIC, 0);  // Opcional: suscribirse si quieres feedback
+        ESP_LOGI(TAG, "MQTT conectado correctamente");
     } else if (event_id == MQTT_EVENT_DISCONNECTED) {
         ESP_LOGW(TAG, "MQTT desconectado");
-    } else if (event_id == MQTT_EVENT_ERROR) {
-        ESP_LOGE(TAG, "MQTT error");
     }
 }
 
@@ -141,7 +139,7 @@ static void mqtt_start(void) {
         .broker.address.uri = MQTT_URI,
         .credentials.username = MQTT_USER,
         .credentials.authentication.password = MQTT_PASS,
-        .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,  // Para TLS
+        .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
     };
     client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
@@ -149,63 +147,83 @@ static void mqtt_start(void) {
 }
 
 // ------------ HTTP POST ------------
-esp_err_t _http_event_handler(esp_http_client_event_t *evt) {
-    switch(evt->event_id) {
-        case HTTP_EVENT_ERROR:
-            ESP_LOGD(TAG, "HTTP_EVENT_ERROR");
-            break;
-        case HTTP_EVENT_ON_CONNECTED:
-            ESP_LOGD(TAG, "HTTP_EVENT_ON_CONNECTED");
-            break;
-        case HTTP_EVENT_HEADER_SENT:
-            ESP_LOGD(TAG, "HTTP_EVENT_HEADER_SENT");
-            break;
-        case HTTP_EVENT_ON_HEADER:
-            ESP_LOGD(TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
-            break;
-        case HTTP_EVENT_ON_DATA:
-            ESP_LOGD(TAG, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
-            break;
-        case HTTP_EVENT_ON_FINISH:
-            ESP_LOGD(TAG, "HTTP_EVENT_ON_FINISH");
-            break;
-        case HTTP_EVENT_DISCONNECTED:
-            ESP_LOGI(TAG, "HTTP_EVENT_DISCONNECTED");
-            break;
-        case HTTP_EVENT_REDIRECT:
-            ESP_LOGD(TAG, "HTTP_EVENT_REDIRECT");
-            break;
-    }
-    return ESP_OK;
-}
-
 bool send_http_post(const char* json_payload) {
     esp_http_client_config_t config = {
         .url = SERVER_URL,
         .method = HTTP_METHOD_POST,
-        .event_handler = _http_event_handler,
-        .timeout_ms = 15000,  // 15s para timeout lento
-        .use_global_ca_store = true,  // <-- AGREGADO: Usa store global de CAs para HTTPS
-        .crt_bundle_attach = esp_crt_bundle_attach,  // <-- AGREGADO: Bundle para verificación TLS
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 15000,
     };
     esp_http_client_handle_t http_client = esp_http_client_init(&config);
 
     esp_http_client_set_header(http_client, "Content-Type", "application/json");
     esp_http_client_set_post_field(http_client, json_payload, strlen(json_payload));
 
-    ESP_LOGI(TAG, "Intentando conectar a: %s", SERVER_URL);  // Debug para URL
-
     esp_err_t err = esp_http_client_perform(http_client);
     if (err == ESP_OK) {
-        int status_code = esp_http_client_get_status_code(http_client);
-        ESP_LOGI(TAG, "HTTP POST Status = %d", status_code);
+        int status = esp_http_client_get_status_code(http_client);
+        ESP_LOGI(TAG, "HTTP POST exitoso → %d", status);
         esp_http_client_cleanup(http_client);
-        return (status_code == 200);
+        return (status == 200 || status == 201);
     } else {
         ESP_LOGE(TAG, "HTTP POST falló: %s", esp_err_to_name(err));
         esp_http_client_cleanup(http_client);
         return false;
     }
+}
+
+// ------------ HTTP GET intervalo aleatorio ------------
+int fetch_interval_seconds(void) {
+    int interval = 15; // fallback
+    char resp_buf[128] = {0};
+
+    esp_http_client_config_t cfg = {
+        .url = UPDATE_URL,
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = 10000,
+        .use_global_ca_store = true,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+    esp_http_client_handle_t http = esp_http_client_init(&cfg);
+
+    if (http == NULL) {
+        ESP_LOGE(TAG, "No se pudo crear cliente HTTP");
+        return interval;
+    }
+
+    // Realizar petición
+    esp_err_t err = esp_http_client_open(http, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "HTTP open fallo: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(http);
+        return interval;
+    }
+
+    int content_length = esp_http_client_fetch_headers(http);
+    int read_len = esp_http_client_read(http, resp_buf, sizeof(resp_buf)-1);
+    esp_http_client_close(http);
+    esp_http_client_cleanup(http);
+
+    if (read_len > 0) {
+        resp_buf[read_len] = '\0';
+        ESP_LOGI(TAG, "Respuesta update: %s", resp_buf);
+        // respuesta esperada: {"intervalSeconds": 42}
+        const char *key = "intervalSeconds";
+        char *pos = strstr(resp_buf, key);
+        if (pos) {
+            pos = strchr(pos, ':');
+            if (pos) {
+                pos++; // avanzar a número
+                while (*pos == ' ' || *pos == '"') pos++;
+                int val = atoi(pos);
+                if (val >= 4 && val <= 60) interval = val;
+            }
+        }
+    } else {
+        ESP_LOGW(TAG, "Sin datos en respuesta de update");
+    }
+
+    return interval;
 }
 
 // ------------ MAIN ------------
@@ -226,7 +244,7 @@ void app_main(void) {
         vTaskDelay(pdMS_TO_TICKS(2000));
     } while (1);
 
-    ESP_LOGI(TAG, "Sistema iniciado. Enviando a MQTT y HTTP cada 3 min...");
+    ESP_LOGI(TAG, "Sistema iniciado. Envío según intervalo aleatorio del backend...");
 
     int temp = 0, hum = 0;
     char json_payload[256];
@@ -260,6 +278,9 @@ void app_main(void) {
             ESP_LOGE(TAG, "Error leyendo DHT22");
         }
 
-        vTaskDelay(pdMS_TO_TICKS(180000));  // 3 segundos 3000 //180000 3 minutos
+        // Consultar nuevo intervalo tras cada envío
+        int intervalSeconds = fetch_interval_seconds();
+        ESP_LOGI(TAG, "Próximo envío en %d segundos", intervalSeconds);
+        vTaskDelay(pdMS_TO_TICKS(intervalSeconds * 1000));
     }
 }
